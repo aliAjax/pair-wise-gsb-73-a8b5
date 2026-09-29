@@ -6,8 +6,6 @@ import type {
   Threat,
   ThreatModelState,
   ValidationIssue,
-  VersionDifference,
-  VersionSnapshot,
 } from '@/models/domain'
 
 const TODAY = new Date('2026-09-29T00:00:00+08:00')
@@ -144,52 +142,6 @@ export const decisionsForThreat = (
 export const reviewProgress = (decisions: ReviewDecision[]): number => {
   const roles = new Set(decisions.map((decision) => decision.role))
   return Math.round((roles.size / 3) * 100)
-}
-
-export const compareSnapshots = (from: VersionSnapshot, to: VersionSnapshot): VersionDifference => {
-  const compare = (
-    category: string,
-    before: string[],
-    after: string[],
-  ): { added: VersionDifference['added']; removed: VersionDifference['removed'] } => {
-    const beforeSet = new Set(before)
-    const afterSet = new Set(after)
-    return {
-      added: after.filter((id) => !beforeSet.has(id)).map((id) => ({ category, id })),
-      removed: before.filter((id) => !afterSet.has(id)).map((id) => ({ category, id })),
-    }
-  }
-
-  const componentDiff = compare('组件', from.componentIds, to.componentIds)
-  const flowDiff = compare('数据流', from.flowIds, to.flowIds)
-  const threatDiff = compare('威胁', from.threatIds, to.threatIds)
-  const controlDiff = compare('控制', from.controlIds, to.controlIds)
-  const riskDiff = compare('风险', from.riskIds, to.riskIds)
-  const affectedBefore = new Set(from.affectedThreatIds)
-  const affectedAfter = new Set(to.affectedThreatIds)
-
-  return {
-    added: [
-      ...componentDiff.added,
-      ...flowDiff.added,
-      ...threatDiff.added,
-      ...controlDiff.added,
-      ...riskDiff.added,
-    ],
-    removed: [
-      ...componentDiff.removed,
-      ...flowDiff.removed,
-      ...threatDiff.removed,
-      ...controlDiff.removed,
-      ...riskDiff.removed,
-    ],
-    changed: [
-      `受影响威胁：${from.affectedThreatIds.length} → ${to.affectedThreatIds.length}`,
-      `新增进入审核：${[...affectedAfter].filter((id) => !affectedBefore.has(id)).join('、') || '无'}`,
-      `退出审核：${[...affectedBefore].filter((id) => !affectedAfter.has(id)).join('、') || '无'}`,
-      `版本说明：${to.notes || '未填写'}`,
-    ],
-  }
 }
 
 export const threatCoverage = (state: ThreatModelState): number => {

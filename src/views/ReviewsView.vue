@@ -43,7 +43,7 @@ const form = reactive<{
   comment: '',
 })
 
-const latestVersion = computed(() => store.data.versions[0])
+const latestVersion = computed(() => store.activeBaseline)
 const affectedThreats = computed(() => {
   const ids = latestVersion.value?.affectedThreatIds ?? store.data.threats.map((threat) => threat.id)
   return store.data.threats.filter((threat) => ids.includes(threat.id))

@@ -3,12 +3,21 @@ import { defineStore } from 'pinia'
 import type {
   ActorRole,
   AuditEvent,
+  BaselineComparison,
   DecisionType,
   Threat,
   ThreatModelState,
   VersionSnapshot,
 } from '@/models/domain'
 import { createId, loadState, resetState, saveState } from '@/services/repository'
+import {
+  baselineStatus,
+  compareBaselines,
+  freezeBaseline,
+  freezeDecisions,
+  previewReviewScope,
+  reconstructLegacyBaseline,
+} from '@/services/baseline'
 import {
   dashboardMetrics,
   decisionsForThreat,
@@ -41,6 +50,15 @@ export const useThreatModelStore = defineStore('threat-model', () => {
   const issues = computed(() => getValidationIssues(data.value))
   const pendingReviews = computed(() =>
     data.value.threats.filter((threat) => threat.reviewStatus === 'in_review'),
+  )
+  // 当前生效基线：优先按指向找到冻结版本；历史数据没有指向时退化为最新版本。
+  const activeBaseline = computed<VersionSnapshot | null>(
+    () =>
+      data.value.versions.find(
+        (version) => version.id === data.value.activeBaselineVersionId,
+      ) ??
+      data.value.versions[0] ??
+      null,
   )
 
   const persist = (): void => {
@@ -98,11 +116,21 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     saveEntity('threats', threat)
   }
 
+  /**
+   * 冻结新版本：模型内容与三方会签意见一起留档；重审范围基于当前生效基线
+   * 与现模型的内容比对自动算出，调用方可以在此基础上增删，但不允许为空。
+   */
   const createVersion = (
     label: string,
     notes: string,
-    affectedThreatIds: string[],
+    affectedThreatIds?: string[],
   ): VersionSnapshot => {
+    const previous = activeBaseline.value
+    const scopeIds =
+      affectedThreatIds && affectedThreatIds.length > 0
+        ? affectedThreatIds
+        : previewReviewScope(data.value, previous).reviewThreatIds
+
     const revision = data.value.currentRevision + 1
     const snapshot: VersionSnapshot = {
       id: createId('ver'),
@@ -111,29 +139,151 @@ export const useThreatModelStore = defineStore('threat-model', () => {
       createdAt: new Date().toISOString(),
       author: '当前用户',
       notes,
+      // 旧编号字段同步保留，旧版界面与降级比对仍可读。
       threatIds: data.value.threats.map((threat) => threat.id),
       componentIds: data.value.components.map((component) => component.id),
       flowIds: data.value.flows.map((flow) => flow.id),
       controlIds: data.value.controls.map((control) => control.id),
       riskIds: data.value.risks.map((risk) => risk.id),
-      affectedThreatIds,
+      affectedThreatIds: scopeIds,
+      // 新结构：冻结时刻的完整模型内容 + 三方意见留档。
+      baseline: freezeBaseline(data.value),
+      decisions: freezeDecisions(data.value),
+      baselineStatus: 'frozen',
     }
     data.value.currentRevision = revision
     data.value.versions.unshift(snapshot)
+    data.value.activeBaselineVersionId = snapshot.id
     data.value.threats = data.value.threats.map((threat) => {
-      if (!affectedThreatIds.includes(threat.id)) {
+      if (!scopeIds.includes(threat.id)) {
         return { ...threat, revision }
       }
-      return { ...threat, revision, reviewStatus: 'in_review' }
+      return { ...threat, revision, reviewStatus: 'in_review' as const }
     })
     appendAudit(
       'version',
       snapshot.id,
       '创建版本',
-      `${label} 已创建，${affectedThreatIds.length} 条威胁进入重新审核`,
+      `${label} 已冻结模型基线与会签意见，${scopeIds.length} 条威胁进入重新审核`,
     )
     persist()
     return snapshot
+  }
+
+  /**
+   * 把一条旧版编号记录补成新结构。单条独立处理、独立落盘：
+   * 中途失败只标记该条 failed 并保留错误信息，其余记录与下次重试不受影响。
+   */
+  const migrateVersion = (versionId: string): { ok: boolean; error?: string } => {
+    const index = data.value.versions.findIndex((version) => version.id === versionId)
+    if (index < 0) return { ok: false, error: '版本不存在' }
+    const snapshot = data.value.versions[index]
+    if (baselineStatus(snapshot) === 'frozen') return { ok: true }
+
+    try {
+      const reconstructed = reconstructLegacyBaseline(snapshot, data.value)
+      const baseline = reconstructed.baseline
+      const stillMissing =
+        snapshot.threatIds.some((id) => !baseline.threats.some((item) => item.id === id)) ||
+        snapshot.componentIds.some((id) => !baseline.components.some((item) => item.id === id)) ||
+        snapshot.flowIds.some((id) => !baseline.flows.some((item) => item.id === id)) ||
+        snapshot.controlIds.some((id) => !baseline.controls.some((item) => item.id === id)) ||
+        snapshot.riskIds.some((id) => !baseline.risks.some((item) => item.id === id))
+      data.value.versions[index] = {
+        ...snapshot,
+        ...reconstructed,
+        baselineStatus: stillMissing ? 'legacy_partial' : 'frozen',
+        migratedAt: new Date().toISOString(),
+        migrationError: undefined,
+      }
+      persist()
+      return { ok: true }
+    } catch (error) {
+      data.value.versions[index] = {
+        ...snapshot,
+        baselineStatus: 'failed',
+        migrationError: error instanceof Error ? error.message : String(error),
+      }
+      persist()
+      return { ok: false, error: data.value.versions[index].migrationError }
+    }
+  }
+
+  /** 首次进入版本页时逐条补档；任意一条失败都可以中断，已成功的条目不回滚。 */
+  const migrateLegacyVersions = (): { succeeded: number; failed: number } => {
+    let succeeded = 0
+    let failed = 0
+    const pendingIds = data.value.versions
+      .filter((version) => baselineStatus(version) !== 'frozen')
+      .map((version) => version.id)
+    pendingIds.forEach((versionId) => {
+      const result = migrateVersion(versionId)
+      if (result.ok) succeeded += 1
+      else failed += 1
+    })
+    if (succeeded > 0 || failed > 0) {
+      appendAudit(
+        'version',
+        'legacy-baseline-migration',
+        '旧基线补档',
+        `旧版本记录补成新结构：成功 ${succeeded} 条${failed > 0 ? `，失败 ${failed} 条（可重试）` : ''}`,
+      )
+      persist()
+    }
+    return { succeeded, failed }
+  }
+
+  /** 创建新版本对话框预选：给出当前生效基线到现模型的重审范围。 */
+  const previewScope = (): BaselineComparison =>
+    previewReviewScope(data.value, activeBaseline.value)
+
+  const compareVersion = (fromId: string, toId: string): BaselineComparison | null => {
+    const from = data.value.versions.find((version) => version.id === fromId)
+    const to = data.value.versions.find((version) => version.id === toId)
+    if (!from || !to) return null
+    return compareBaselines(from, to)
+  }
+
+  /**
+   * 回滚到选中版本：只恢复该基线冻结的建模对象与其归档意见，
+   * 不删除任何更新版本、不改写后续批注（意见只增补不覆盖）、不动既有审计轨迹，
+   * 仅追加一条回滚审计并把生效基线指向切到选中版本。
+   */
+  const rollbackToVersion = (versionId: string): { ok: boolean; error?: string } => {
+    const snapshot = data.value.versions.find((version) => version.id === versionId)
+    if (!snapshot) return { ok: false, error: '版本不存在' }
+    if (!snapshot.baseline) return { ok: false, error: '该版本尚未补成新结构，请先补档' }
+
+    const restored = snapshot.baseline
+    data.value.boundary = structuredClone(restored.boundary)
+    data.value.zones = structuredClone(restored.zones)
+    data.value.components = structuredClone(restored.components)
+    data.value.dependencies = structuredClone(restored.dependencies)
+    data.value.flows = structuredClone(restored.flows)
+    data.value.controls = structuredClone(restored.controls)
+    data.value.evidence = structuredClone(restored.evidence)
+    data.value.threats = structuredClone(restored.threats)
+    data.value.attackPaths = structuredClone(restored.attackPaths)
+    data.value.risks = structuredClone(restored.risks)
+    data.value.mitigations = structuredClone(restored.mitigations)
+
+    // 归档意见只增补：现存意见（后续批注）一律保留，已不存在的旧意见按原 id 补回。
+    const liveDecisionIds = new Set(data.value.decisions.map((decision) => decision.id))
+    const archived = (snapshot.decisions ?? []).filter(
+      (decision) => !liveDecisionIds.has(decision.id),
+    )
+    if (archived.length > 0) data.value.decisions.unshift(...structuredClone(archived))
+
+    data.value.activeBaselineVersionId = snapshot.id
+    // currentRevision 不回退：下次建版仍单调递增，避免撞掉进行中的会签轮次。
+    appendAudit(
+      'version',
+      snapshot.id,
+      '回滚基线',
+      `建模内容已恢复到 ${snapshot.label}；后续批注与审计记录均保留，更新版本未被删除`,
+    )
+    persist()
+    return { ok: true }
   }
 
   const submitDecision = (
@@ -273,11 +423,17 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     metrics,
     issues,
     pendingReviews,
+    activeBaseline,
     saveEntity,
     removeEntity,
     updateBoundary,
     saveThreat,
     createVersion,
+    migrateVersion,
+    migrateLegacyVersions,
+    previewScope,
+    compareVersion,
+    rollbackToVersion,
     submitDecision,
     updateMitigationStatus,
     acceptRisk,

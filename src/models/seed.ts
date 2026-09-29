@@ -1,5 +1,6 @@
 import type {
   AuditEvent,
+  BaselinePayload,
   ControlEvidence,
   MitigationTask,
   ReviewDecision,
@@ -136,21 +137,8 @@ const decisions: ReviewDecision[] = [
   },
 ]
 
+// 顺序与建版时的 unshift 语义一致：最新版本在前。
 const baselineVersions: VersionSnapshot[] = [
-  {
-    id: 'ver-01',
-    revision: 1,
-    label: 'v1.0 初始基线',
-    createdAt: '2026-08-28T10:00:00+08:00',
-    author: '王岚',
-    notes: '完成系统边界、信任区与核心威胁基线。',
-    threatIds: ['thr-01', 'thr-02', 'thr-03'],
-    componentIds: ['cmp-01', 'cmp-02', 'cmp-03', 'cmp-04', 'cmp-05'],
-    flowIds: ['flow-01', 'flow-02', 'flow-03', 'flow-04'],
-    controlIds: ['ctl-01', 'ctl-02', 'ctl-03', 'ctl-04'],
-    riskIds: ['risk-01', 'risk-02', 'risk-03'],
-    affectedThreatIds: ['thr-01', 'thr-02', 'thr-03'],
-  },
   {
     id: 'ver-02',
     revision: 2,
@@ -164,6 +152,22 @@ const baselineVersions: VersionSnapshot[] = [
     controlIds: ['ctl-01', 'ctl-02', 'ctl-03', 'ctl-04'],
     riskIds: ['risk-01', 'risk-02', 'risk-03', 'risk-04'],
     affectedThreatIds: ['thr-01', 'thr-02'],
+    // 旧版记录：只有对象编号，没有内容留档——第一次使用时触发补档。
+  },
+  {
+    id: 'ver-01',
+    revision: 1,
+    label: 'v1.0 初始基线',
+    createdAt: '2026-08-28T10:00:00+08:00',
+    author: '王岚',
+    notes: '完成系统边界、信任区与核心威胁基线。',
+    threatIds: ['thr-01', 'thr-02', 'thr-03'],
+    componentIds: ['cmp-01', 'cmp-02', 'cmp-03', 'cmp-04', 'cmp-05'],
+    flowIds: ['flow-01', 'flow-02', 'flow-03', 'flow-04'],
+    controlIds: ['ctl-01', 'ctl-02', 'ctl-03', 'ctl-04'],
+    riskIds: ['risk-01', 'risk-02', 'risk-03'],
+    affectedThreatIds: ['thr-01', 'thr-02', 'thr-03'],
+    // baseline/decisions 在 createSeedState 中按当前模型冻结补齐。
   },
 ]
 
@@ -197,7 +201,8 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const createSeedState = (): ThreatModelState => ({
+export const createSeedState = (): ThreatModelState => {
+  const state: ThreatModelState = {
   boundary: {
     id: 'boundary-01',
     name: '客户运营与分析平台',
@@ -401,7 +406,8 @@ export const createSeedState = (): ThreatModelState => ({
       description: '公网管理入口被枚举后，攻击者可能利用弱会话或泄露令牌进入运营服务。',
       severity: 'critical',
       status: 'mitigating',
-      componentIds: ['cmp-01', 'cmp-02'],
+      // v1.1：伙伴同步器落在业务隔离区，凭证滥用面扩大到该入口。
+      componentIds: ['cmp-01', 'cmp-02', 'cmp-06'],
       flowIds: ['flow-01'],
       externalDependencyIds: [],
       attackPathIds: ['path-01'],
@@ -418,12 +424,13 @@ export const createSeedState = (): ThreatModelState => ({
       description: '归档服务使用长期静态密钥，一旦泄露可批量访问受限报表。',
       severity: 'high',
       status: 'mitigating',
-      componentIds: ['cmp-04', 'cmp-05'],
-      flowIds: ['flow-04'],
-      externalDependencyIds: ['dep-02'],
+      // v1.1：伙伴归因链路引入独立签名密钥与新数据落点，密钥泄露面扩大。
+      componentIds: ['cmp-04', 'cmp-05', 'cmp-06'],
+      flowIds: ['flow-04', 'flow-05'],
+      externalDependencyIds: ['dep-02', 'dep-03'],
       attackPathIds: ['path-02'],
       controlIds: ['ctl-02', 'ctl-03'],
-      riskIds: ['risk-02'],
+      riskIds: ['risk-02', 'risk-04'],
       reviewStatus: 'approved',
       revision: 2,
     },
@@ -516,4 +523,48 @@ export const createSeedState = (): ThreatModelState => ({
   versions: baselineVersions,
   audit,
   currentRevision: 2,
-})
+  activeBaselineVersionId: 'ver-02',
+  }
+
+  // v1.0 基线：把当前模型中 v1.1 才引入的对象剔除后冻结，并把威胁会签状态还原为 r1。
+  const clone = <T>(value: T): T => structuredClone(value)
+  const initialBaseline: BaselinePayload = {
+    boundary: clone(state.boundary),
+    zones: state.zones.map(clone),
+    components: state.components.filter((component) => component.id !== 'cmp-06').map(clone),
+    dependencies: state.dependencies.filter((dependency) => dependency.id !== 'dep-03').map(clone),
+    flows: state.flows.filter((flow) => flow.id !== 'flow-05').map(clone),
+    controls: state.controls.map(clone),
+    evidence: state.evidence.map(clone),
+    threats: state.threats.map((threat) => {
+      // v1.0 时伙伴接入尚未发生，剔除 v1.1 才扩进来的引用，保证两个冻结基线可做内容级比对。
+      const atV1: Record<string, Partial<ThreatModelState['threats'][number]>> = {
+        'thr-01': { componentIds: ['cmp-01', 'cmp-02'] },
+        'thr-02': {
+          componentIds: ['cmp-04', 'cmp-05'],
+          flowIds: ['flow-04'],
+          externalDependencyIds: ['dep-02'],
+          riskIds: ['risk-02'],
+        },
+      }
+      return {
+        ...clone(threat),
+        ...atV1[threat.id],
+        revision: 1,
+        reviewStatus: 'in_review',
+      }
+    }),
+    attackPaths: state.attackPaths.map(clone),
+    risks: state.risks.filter((risk) => risk.id !== 'risk-04').map(clone),
+    mitigations: state.mitigations.map(clone),
+  }
+
+  const initialVersion = state.versions.find((version) => version.id === 'ver-01')
+  if (initialVersion) {
+    initialVersion.baseline = initialBaseline
+    initialVersion.decisions = []
+    initialVersion.baselineStatus = 'frozen'
+  }
+  // ver-02 刻意不补 baseline：作为旧编号记录，演示首次使用时按需补档。
+  return state
+}
