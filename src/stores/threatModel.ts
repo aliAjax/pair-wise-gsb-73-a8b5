@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, toRaw } from 'vue'
 import { defineStore } from 'pinia'
 import type {
   ActorRole,
@@ -8,6 +8,12 @@ import type {
   ThreatModelState,
   VersionSnapshot,
 } from '@/models/domain'
+import {
+  BASELINE_MIGRATION_STEPS,
+  computeAffectedThreats,
+  freezeBaseline,
+  migrateSnapshotBaseline,
+} from '@/services/baseline'
 import { createId, loadState, resetState, saveState } from '@/services/repository'
 import {
   dashboardMetrics,
@@ -98,12 +104,50 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     saveEntity('threats', threat)
   }
 
+  const ensureVersionBaseline = (versionId: string): VersionSnapshot | null => {
+    const snapshot = data.value.versions.find((version) => version.id === versionId)
+    if (!snapshot || snapshot.baseline) return snapshot ?? null
+    migrateSnapshotBaseline(snapshot, data.value)
+    if (snapshot.baseline) {
+      appendAudit(
+        'version',
+        snapshot.id,
+        '基线升级',
+        `${snapshot.label} 已补全为完整基线（模型内容与三方意见留档）`,
+      )
+    } else {
+      appendAudit(
+        'version',
+        snapshot.id,
+        '基线升级中断',
+        `${snapshot.label} 升级未完成：${snapshot.migration?.error ?? '未知原因'}，可从断点继续`,
+      )
+    }
+    persist()
+    return snapshot
+  }
+
+  const previewAffectedThreats = (): string[] => {
+    const previous = data.value.versions[0]
+    if (!previous) return data.value.threats.map((threat) => threat.id)
+    ensureVersionBaseline(previous.id)
+    if (!previous.baseline) return data.value.threats.map((threat) => threat.id)
+    return computeAffectedThreats(previous.baseline, freezeBaseline(data.value))
+  }
+
   const createVersion = (
     label: string,
     notes: string,
-    affectedThreatIds: string[],
+    manualAffectedThreatIds: string[] = [],
   ): VersionSnapshot => {
     const revision = data.value.currentRevision + 1
+    const previous = data.value.versions[0]
+    if (previous) ensureVersionBaseline(previous.id)
+    const baseline = freezeBaseline(data.value)
+    const autoAffected = previous?.baseline
+      ? computeAffectedThreats(previous.baseline, baseline)
+      : data.value.threats.map((threat) => threat.id)
+    const affectedThreatIds = [...new Set([...autoAffected, ...manualAffectedThreatIds])]
     const snapshot: VersionSnapshot = {
       id: createId('ver'),
       revision,
@@ -117,12 +161,18 @@ export const useThreatModelStore = defineStore('threat-model', () => {
       controlIds: data.value.controls.map((control) => control.id),
       riskIds: data.value.risks.map((risk) => risk.id),
       affectedThreatIds,
+      baseline,
+      migration: {
+        status: 'done',
+        completedSteps: [...BASELINE_MIGRATION_STEPS],
+        updatedAt: new Date().toISOString(),
+      },
     }
     data.value.currentRevision = revision
     data.value.versions.unshift(snapshot)
     data.value.threats = data.value.threats.map((threat) => {
       if (!affectedThreatIds.includes(threat.id)) {
-        return { ...threat, revision }
+        return threat
       }
       return { ...threat, revision, reviewStatus: 'in_review' }
     })
@@ -130,7 +180,41 @@ export const useThreatModelStore = defineStore('threat-model', () => {
       'version',
       snapshot.id,
       '创建版本',
-      `${label} 已创建，${affectedThreatIds.length} 条威胁进入重新审核`,
+      `${label} 已创建并冻结基线，${affectedThreatIds.length} 条威胁进入重新审核，未受影响威胁的会签保持不变`,
+    )
+    persist()
+    return snapshot
+  }
+
+  const rollbackToVersion = (versionId: string): VersionSnapshot | null => {
+    const snapshot = ensureVersionBaseline(versionId)
+    if (!snapshot?.baseline) return null
+    const baseline = snapshot.baseline
+    const affectedThreatIds = computeAffectedThreats(freezeBaseline(data.value), baseline)
+    const currentThreats = new Map(data.value.threats.map((threat) => [threat.id, threat]))
+
+    data.value.threats = baseline.threats.map((frozen) => {
+      const restored = structuredClone(toRaw(frozen))
+      const current = currentThreats.get(frozen.id)
+      if (current) {
+        restored.revision = current.revision
+      }
+      if (affectedThreatIds.includes(frozen.id)) {
+        restored.reviewStatus = 'in_review'
+      } else if (current) {
+        restored.reviewStatus = current.reviewStatus
+      }
+      return restored
+    })
+    data.value.components = baseline.components.map((item) => structuredClone(toRaw(item)))
+    data.value.flows = baseline.flows.map((item) => structuredClone(toRaw(item)))
+    data.value.controls = baseline.controls.map((item) => structuredClone(toRaw(item)))
+    data.value.risks = baseline.risks.map((item) => structuredClone(toRaw(item)))
+    appendAudit(
+      'version',
+      snapshot.id,
+      '回滚版本',
+      `模型内容已恢复至 ${snapshot.label}，${affectedThreatIds.length} 条威胁需重新审核；既有会签批注与审计轨迹保持不变`,
     )
     persist()
     return snapshot
@@ -278,6 +362,9 @@ export const useThreatModelStore = defineStore('threat-model', () => {
     updateBoundary,
     saveThreat,
     createVersion,
+    rollbackToVersion,
+    ensureVersionBaseline,
+    previewAffectedThreats,
     submitDecision,
     updateMitigationStatus,
     acceptRisk,

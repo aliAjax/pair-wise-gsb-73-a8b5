@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watchEffect } from 'vue'
 import Button from 'primevue/button'
 import Column from 'primevue/column'
 import DataTable from 'primevue/datatable'
@@ -18,10 +18,16 @@ const toast = useToast()
 const fromVersionId = ref(store.data.versions[1]?.id ?? store.data.versions[0]?.id ?? '')
 const toVersionId = ref(store.data.versions[0]?.id ?? '')
 const createVisible = ref(false)
+const autoAffectedIds = ref<string[]>([])
 const createForm = reactive({
   label: '',
   notes: '',
-  affectedThreatIds: [] as string[],
+  extraThreatIds: [] as string[],
+})
+
+watchEffect(() => {
+  if (fromVersionId.value) store.ensureVersionBaseline(fromVersionId.value)
+  if (toVersionId.value) store.ensureVersionBaseline(toVersionId.value)
 })
 
 const fromVersion = computed(
@@ -33,7 +39,12 @@ const toVersion = computed(
 const difference = computed(() =>
   fromVersion.value && toVersion.value
     ? compareSnapshots(fromVersion.value, toVersion.value)
-    : { added: [], removed: [], changed: [] },
+    : { added: [], removed: [], changed: [], changedDetails: [], affectedThreatIds: [] },
+)
+const reReviewThreats = computed(() =>
+  difference.value.affectedThreatIds
+    .map((id) => store.data.threats.find((threat) => threat.id === id))
+    .filter((threat): threat is NonNullable<typeof threat> => Boolean(threat)),
 )
 
 const entityName = (change: VersionChange): string => {
@@ -63,28 +74,70 @@ const entityName = (change: VersionChange): string => {
 const openCreate = (): void => {
   createForm.label = `v1.${store.data.currentRevision + 1} 变更评审`
   createForm.notes = ''
-  createForm.affectedThreatIds = []
+  createForm.extraThreatIds = []
+  autoAffectedIds.value = store.previewAffectedThreats()
   createVisible.value = true
 }
+
+const autoAffectedNames = computed(() =>
+  autoAffectedIds.value
+    .map((id) => store.data.threats.find((threat) => threat.id === id))
+    .filter((threat): threat is NonNullable<typeof threat> => Boolean(threat)),
+)
 
 const createVersion = (): void => {
   if (!createForm.label.trim() || !createForm.notes.trim()) {
     toast.add({ severity: 'error', summary: '校验失败', detail: '版本名称和变更说明不能为空', life: 3000 })
     return
   }
-  if (createForm.affectedThreatIds.length === 0) {
-    toast.add({ severity: 'error', summary: '校验失败', detail: '至少选择一条受影响威胁', life: 3000 })
-    return
-  }
-  const snapshot = store.createVersion(
-    createForm.label,
-    createForm.notes,
-    createForm.affectedThreatIds,
-  )
+  const snapshot = store.createVersion(createForm.label, createForm.notes, createForm.extraThreatIds)
   fromVersionId.value = toVersionId.value
   toVersionId.value = snapshot.id
   createVisible.value = false
-  toast.add({ severity: 'success', summary: '版本已创建', detail: '仅受影响威胁进入重新审核', life: 3000 })
+  toast.add({
+    severity: 'success',
+    summary: '版本已创建',
+    detail: `基线已冻结，${snapshot.affectedThreatIds.length} 条威胁进入重新审核`,
+    life: 3000,
+  })
+}
+
+const retryMigration = (snapshot: VersionSnapshot): void => {
+  const result = store.ensureVersionBaseline(snapshot.id)
+  if (result?.baseline) {
+    toast.add({ severity: 'success', summary: '升级完成', detail: `${snapshot.label} 已补全为完整基线`, life: 3000 })
+  } else {
+    toast.add({
+      severity: 'warn',
+      summary: '升级仍未完成',
+      detail: result?.migration?.error ?? '未知原因',
+      life: 4000,
+    })
+  }
+}
+
+const rollback = (snapshot: VersionSnapshot): void => {
+  const confirmed = window.confirm(
+    `确认将模型内容回滚至「${snapshot.label}」？\n会签批注与审计轨迹不会被改写。`,
+  )
+  if (!confirmed) return
+  const result = store.rollbackToVersion(snapshot.id)
+  if (!result) {
+    toast.add({ severity: 'error', summary: '回滚失败', detail: '该版本基线尚未升级完成', life: 3000 })
+    return
+  }
+  toast.add({
+    severity: 'success',
+    summary: '已回滚',
+    detail: `模型内容已恢复至 ${snapshot.label}，批注与审计保持不变`,
+    life: 3000,
+  })
+}
+
+const baselineLabel = (snapshot: VersionSnapshot): string => {
+  if (snapshot.baseline) return '已冻结'
+  if (snapshot.migration?.status === 'failed') return '升级中断'
+  return '待升级'
 }
 
 const approvalLabel = (snapshot: VersionSnapshot): string =>
@@ -147,10 +200,33 @@ const approvalLabel = (snapshot: VersionSnapshot): string =>
         </div>
       </div>
       <div class="changed-list">
-        <h4>重新审核差异</h4>
-        <div v-for="item in difference.changed" :key="item" class="changed-item">
-          <i class="pi pi-arrow-right"></i>
-          <span>{{ item }}</span>
+        <h4>内容变更明细</h4>
+        <template v-if="difference.changedDetails.length">
+          <div v-for="entry in difference.changedDetails" :key="`${entry.category}-${entry.id}`" class="changed-item">
+            <i class="pi pi-arrow-right"></i>
+            <div>
+              <strong>{{ entry.category }} · {{ entry.name }}</strong>
+              <p v-for="field in entry.fields" :key="field.field">
+                {{ field.field }}：<span class="field-before">{{ field.before }}</span>
+                → <span class="field-after">{{ field.after }}</span>
+              </p>
+            </div>
+          </div>
+        </template>
+        <template v-else-if="difference.changed.length">
+          <div v-for="item in difference.changed" :key="item" class="changed-item">
+            <i class="pi pi-arrow-right"></i>
+            <span>{{ item }}</span>
+          </div>
+        </template>
+        <span v-else class="muted">两个基线的模型内容一致</span>
+      </div>
+      <div v-if="difference.affectedThreatIds.length" class="rereview-list">
+        <h4>需重新会签的威胁（{{ difference.affectedThreatIds.length }}）</h4>
+        <div class="rereview-chips">
+          <span v-for="threat in reReviewThreats" :key="threat.id" class="rereview-chip">
+            {{ threat.code }} {{ threat.title }}
+          </span>
         </div>
       </div>
     </section>
@@ -178,6 +254,32 @@ const approvalLabel = (snapshot: VersionSnapshot): string =>
           </Column>
           <Column header="通过" style="width: 80px">
             <template #body="{ data }">{{ approvalLabel(data) }}</template>
+          </Column>
+          <Column header="基线" style="width: 130px">
+            <template #body="{ data }">
+              <span :class="['baseline-tag', { 'baseline-failed': data.migration?.status === 'failed' }]">
+                {{ baselineLabel(data) }}
+              </span>
+              <Button
+                v-if="!data.baseline"
+                label="继续升级"
+                text
+                size="small"
+                @click="retryMigration(data)"
+              />
+            </template>
+          </Column>
+          <Column header="操作" style="width: 90px">
+            <template #body="{ data }">
+              <Button
+                label="回滚"
+                icon="pi pi-undo"
+                text
+                size="small"
+                :disabled="!data.baseline"
+                @click="rollback(data)"
+              />
+            </template>
           </Column>
           <Column field="notes" header="说明" />
         </DataTable>
@@ -216,17 +318,29 @@ const approvalLabel = (snapshot: VersionSnapshot): string =>
           />
         </div>
         <div class="field field-wide">
-          <label>受影响威胁</label>
+          <label>自动算出的重审范围</label>
+          <div class="auto-affected">
+            <span v-for="threat in autoAffectedNames" :key="threat.id" class="rereview-chip">
+              {{ threat.code }} {{ threat.title }}
+            </span>
+            <span v-if="autoAffectedNames.length === 0" class="muted">
+              与上一基线相比无内容变化，无需重审
+            </span>
+          </div>
+          <small class="muted">由前后两个基线的内容差异自动计算，随版本一起冻结留档。</small>
+        </div>
+        <div class="field field-wide">
+          <label>手动补充受影响威胁</label>
           <MultiSelect
-            v-model="createForm.affectedThreatIds"
+            v-model="createForm.extraThreatIds"
             :options="store.data.threats"
             option-label="title"
             option-value="id"
             display="chip"
             filter
-            placeholder="只选择需要重新会签的威胁"
+            placeholder="在自动范围之外补充需要重审的威胁"
           />
-          <small class="muted">未选择的威胁保持已通过状态，不会进入新版本会签队列。</small>
+          <small class="muted">未进入重审范围的威胁保持当前会签状态，进行中的会签不会被冲掉。</small>
         </div>
       </div>
       <template #footer>
@@ -309,6 +423,67 @@ const approvalLabel = (snapshot: VersionSnapshot): string =>
   padding: 6px 0;
   color: #515e73;
   font-size: 12px;
+}
+
+.changed-item strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #39445a;
+  font-size: 12px;
+}
+
+.changed-item p {
+  margin: 2px 0;
+  color: #5f6a7e;
+  font-size: 12px;
+}
+
+.field-before {
+  color: #a8543f;
+}
+
+.field-after {
+  color: #2f7d5b;
+  font-weight: 600;
+}
+
+.rereview-list {
+  padding: 0 16px 18px;
+}
+
+.rereview-list h4 {
+  margin: 0 0 10px;
+  font-size: 14px;
+}
+
+.rereview-chips,
+.auto-affected {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rereview-chip {
+  padding: 3px 10px;
+  border: 1px solid #d7c49a;
+  border-radius: 999px;
+  background: #faf3e3;
+  color: #7a5b1d;
+  font-size: 11px;
+}
+
+.baseline-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: #e8f0e9;
+  color: #2f7d5b;
+  font-size: 11px;
+}
+
+.baseline-tag.baseline-failed {
+  background: #f7e6e1;
+  color: #b0452f;
 }
 
 .changed-item i {

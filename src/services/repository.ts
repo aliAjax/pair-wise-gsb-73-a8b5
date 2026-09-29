@@ -3,7 +3,7 @@ import { createSeedState } from '@/models/seed'
 
 const STORAGE_KEY = 'scapex-threat-model-v1'
 
-const clone = <T>(value: T): T => structuredClone(value)
+const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 export const loadState = (): ThreatModelState => {
   const raw = localStorage.getItem(STORAGE_KEY)

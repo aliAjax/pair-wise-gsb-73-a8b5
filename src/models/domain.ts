@@ -138,6 +138,31 @@ export interface ReviewDecision {
   revision: number
 }
 
+export interface VersionBaseline {
+  threats: Threat[]
+  components: ArchitectureComponent[]
+  flows: DataFlow[]
+  controls: SecurityControl[]
+  risks: Risk[]
+  decisions: ReviewDecision[]
+}
+
+export type BaselineMigrationStep =
+  | 'threats'
+  | 'components'
+  | 'flows'
+  | 'controls'
+  | 'risks'
+  | 'decisions'
+
+export interface VersionMigration {
+  status: 'pending' | 'done' | 'failed'
+  completedSteps: BaselineMigrationStep[]
+  error?: string
+  note?: string
+  updatedAt: string
+}
+
 export interface VersionSnapshot {
   id: string
   revision: number
@@ -151,6 +176,9 @@ export interface VersionSnapshot {
   controlIds: string[]
   riskIds: string[]
   affectedThreatIds: string[]
+  baseline?: VersionBaseline
+  draftBaseline?: VersionBaseline
+  migration?: VersionMigration
 }
 
 export interface AuditEvent {
@@ -195,8 +223,23 @@ export interface VersionChange {
   id: string
 }
 
+export interface VersionFieldChange {
+  field: string
+  before: string
+  after: string
+}
+
+export interface VersionEntityChange {
+  category: string
+  id: string
+  name: string
+  fields: VersionFieldChange[]
+}
+
 export interface VersionDifference {
   added: VersionChange[]
   removed: VersionChange[]
   changed: string[]
+  changedDetails: VersionEntityChange[]
+  affectedThreatIds: string[]
 }

@@ -9,6 +9,7 @@ import type {
   VersionDifference,
   VersionSnapshot,
 } from '@/models/domain'
+import { diffBaselines } from '@/services/baseline'
 
 const TODAY = new Date('2026-09-29T00:00:00+08:00')
 
@@ -147,6 +148,10 @@ export const reviewProgress = (decisions: ReviewDecision[]): number => {
 }
 
 export const compareSnapshots = (from: VersionSnapshot, to: VersionSnapshot): VersionDifference => {
+  if (from.baseline && to.baseline) {
+    return diffBaselines(from.baseline, to.baseline)
+  }
+
   const compare = (
     category: string,
     before: string[],
@@ -189,6 +194,8 @@ export const compareSnapshots = (from: VersionSnapshot, to: VersionSnapshot): Ve
       `退出审核：${[...affectedBefore].filter((id) => !affectedAfter.has(id)).join('、') || '无'}`,
       `版本说明：${to.notes || '未填写'}`,
     ],
+    changedDetails: [],
+    affectedThreatIds: [],
   }
 }
 
